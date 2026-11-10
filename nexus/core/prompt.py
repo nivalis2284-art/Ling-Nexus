@@ -1,0 +1,348 @@
+"""Prompt assembly and context budget.
+
+Two ideas matter here:
+
+1. The system prompt is *assembled at runtime*, not a constant. The workspace,
+   git state and instruction files change; a static string would be wrong by
+   the second run.
+2. Selection measures atomic tool exchanges. The Agent compacts before older
+   messages would be dropped and reports oversized input without deleting it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import compaction
+from .workspace import Workspace
+from ..cache import CACHE
+
+ROLE_RULES = """Work from evidence toward the user's requested outcome.
+Continue until it is complete or a concrete blocker needs the user.
+
+# Scope and execution
+- For questions, reviews and plans, inspect relevant information and answer; do not
+  implement changes unless requested. For change requests, use tools to deliver the
+  result.
+- Use authorization already given. Make routine implementation choices yourself;
+  ask when missing information or an unresolved decision affects correctness,
+  scope or authorization. Never change the goal to make work easier.
+- Read before editing; preserve unrelated user changes and project conventions.
+  Prefer dedicated tools and targeted edits. Update affected callers and interfaces
+  without adding unrequested features.
+- If a tool fails, read the error and adapt. Retry when the failure is transient or
+  the call or input has been corrected. Do not repeat an unchanged failed call
+  without a reason to expect a different result.
+
+# Verification and delivery
+- Verify the deliverable against the request: relevant project checks for code;
+  sources, facts and coverage for research or documents. A successful tool call
+  alone does not prove completion.
+- Keep verification proportional. After relevant checks pass, stop unless new
+  changes, failures or concrete unresolved concerns justify more work. Report
+  checks and unverified limits honestly.
+- Use the user's language. Give meaningful progress or blocker updates; finish with
+  results, artifact paths, verification and material limitations. Distinguish work
+  accepted or still running from work completed."""
+
+ROLE = "You are an assistant executing the user's requested work in Nexus.\n\n" + ROLE_RULES
+
+SUBAGENT_ROLE = """You are a subagent in Nexus. Complete only the delegated scope and respect the
+parent's supplied constraints. Return concrete findings or deliverables, checks and
+remaining limitations for the parent to use. Do not expand into the parent's whole
+task, approve actions for the owner or claim that the parent's work is complete.
+
+""" + ROLE_RULES
+
+ENVIRONMENT = """Environment:
+- Platform: {platform}
+- Date: {date}{shell}
+{workspace}"""
+
+INSTRUCTION_PRIORITY = """# Instruction sources and priority
+- Owner instructions are the owner's persistent preferences from the Nexus data
+  directory. They are not repository files.
+- Project instructions are labeled files found in the workspace root and in
+  directories already touched inside this workspace. Each block names its
+  absolute path and scope; a nested file covers that directory and below.
+- The owner is the highest authority. An explicit current owner request overrides
+  general preferences, examples, templates, ordinary habits, older summaries, and
+  the owner's own project instructions, and may change them; state which rule
+  changed.
+- A general or vague request yields to an explicit, specific project boundary in
+  scope. That boundary never overrides an explicit owner request.
+- Only when a conflict cannot be resolved from the request and the rules, ask the
+  owner instead of guessing.
+- A template, example, or ordinary habit is guidance; do not promote it into a hard
+  prohibition."""
+
+
+@dataclass(frozen=True)
+class Budget:
+    context_limit: int = 64_000
+    output_reserve: int = 8_000
+    tool_reserve: int = 2_000
+
+    @property
+    def input_limit(self) -> int:
+        limit = self.context_limit - self.output_reserve - self.tool_reserve
+        return max(limit, 0)
+
+
+@dataclass
+class Context:
+    instructions: str
+    messages: list[dict[str, Any]]
+    manifest: dict[str, Any] = field(default_factory=dict)
+
+
+def estimate(text: str) -> int:
+    """Conservative token estimate: bytes / 3 (CJK is ~3 bytes per token).
+
+    Deliberately not presented as the provider's own count. A real usage number
+    arrives after the call; this only decides how much to send.
+    """
+    return compaction.estimate(text)
+
+
+def build_system_sections(
+    workspace: Workspace,
+    tools: str,
+    *,
+    platform: str,
+    date: str,
+    role: str = ROLE,
+    owner_instructions: str = "",
+    skills: str = "",
+    task_context: str = "",
+    interaction_context: str = "",
+    permission_context: str = "",
+) -> list[dict[str, str]]:
+    """Return the real system sections in their assembled order.
+
+    The prompt builder and the read-only context view share this function.
+    Inputs can differ between a preview and a particular model request.
+    """
+    sections: list[dict[str, str]] = []
+
+    def add(section_id: str, title: str, text: str) -> None:
+        sections.append({"id": section_id, "title": title, "text": text})
+
+    tool_names = {line[2:].split(":", 1)[0] for line in tools.splitlines()
+                  if line.startswith("- ") and ":" in line}
+    if owner_instructions:
+        add(
+            "owner",
+            "Owner instructions",
+            "# Owner instructions\n"
+            "Source: `owner-instructions.txt` in the Nexus data directory; this file is "
+            "owner-controlled and outside the workspace.\n"
+            "Nature: durable owner preferences and constraints; the current explicit "
+            "owner request may override them.\n\n"
+            + owner_instructions,
+        )
+    add("role", "Role", role)
+    shell = ""
+    if "powershell" in tool_names:
+        shell = (
+            "\n- Shell: Windows PowerShell. Use the powershell tool for commands. "
+            "Each call starts in the "
+            "workspace root with a fresh process."
+        )
+        if "powershell_background" in tool_names:
+            shell += " Use powershell_background for long-running jobs."
+    elif "bash" in tool_names:
+        shell = (
+            "\n- Shell: none; bash receives one command-line string (not an argv list), "
+            "splits it into argv, and does not interpret shell operators. Its working "
+            "directory is the workspace root."
+        )
+    env = ENVIRONMENT.format(
+        platform=platform,
+        date=date,
+        shell=shell,
+        workspace=workspace.summary(),
+    )
+    add("environment", "Environment", env + f"\n- Temporary work files: {CACHE}. Keep deliverables in the requested destination.")
+    add("priority", "Instruction priority", INSTRUCTION_PRIORITY)
+    if workspace.instructions:
+        add(
+            "project",
+            "Project instructions",
+            "# Project instructions\n"
+            "Source: instruction files in the workspace root, plus directories "
+            "already touched inside this workspace.\n"
+            "Nature: workspace-specific requirements and habits within each stated scope.\n"
+            "Each block names its absolute file path and scope. A nested block applies "
+            "to that directory and its descendants.\n\n"
+            + workspace.instructions,
+        )
+    if skills:
+        # Only names, descriptions and trigger hints. Bodies are read on demand
+        # with read_skill, so an unused skill costs one line, not a page.
+        add(
+            "skills",
+            "Skills",
+            "# Skills\n"
+            "Source: installed skill manifests.\n"
+            "Nature: reusable procedures when they apply; they are not project authority.\n"
+            + ("When one applies, call read_skill with its exact name before doing the work.\n"
+               if "read_skill" in tool_names else "")
+            + skills,
+        )
+    if interaction_context:
+        add(
+            "interaction",
+            "Continuing interaction",
+            "# Continuing interaction\n"
+            "Source: current Nexus conversation and work state.\n"
+            "Nature: context and pending events, not new permission or authorization.\n\n"
+            + interaction_context,
+        )
+    if task_context:
+        add(
+            "task",
+            "Persistent task state",
+            "# Persistent task state\n"
+            "Source: the task controller's saved state for current work.\n"
+            "Nature: current task context and recorded progress, not a new instruction "
+            "or authorization. It outranks old model summaries and yields to the latest "
+            "explicit owner request and applicable project rules.\n"
+            "Check actual results before claiming success. "
+            "Progress, plans, and supporting records are optional; update them when useful.\n\n"
+            + task_context,
+        )
+    if permission_context:
+        add(
+            "permission",
+            "Permission context",
+            "# Permission context\n"
+            "Source: supplied by the main agent for this request.\n"
+            "Nature: the permission and approval information actually available in this "
+            "run. Do not assume broader access.\n\n"
+            + permission_context,
+        )
+    if tools:
+        add(
+            "tools",
+            "Tools",
+            "# Tools\n"
+            "Source: this run's tool registry. Only the tools listed below are available.\n"
+            "Call them with their exact names. Arguments must match the schema.\n"
+            + tools,
+        )
+    return sections
+
+
+def build_system_prompt(
+    workspace: Workspace,
+    tools: str,
+    *,
+    platform: str,
+    date: str,
+    role: str = ROLE,
+    owner_instructions: str = "",
+    skills: str = "",
+    task_context: str = "",
+    interaction_context: str = "",
+    permission_context: str = "",
+) -> str:
+    sections = build_system_sections(
+        workspace,
+        tools,
+        platform=platform,
+        date=date,
+        role=role,
+        owner_instructions=owner_instructions,
+        skills=skills,
+        task_context=task_context,
+        interaction_context=interaction_context,
+        permission_context=permission_context,
+    )
+    return "\n\n".join(section["text"] for section in sections)
+
+
+def permission_text(policy: Any) -> str:
+    """The permission section body used for the current request policy."""
+    import json
+
+    return (
+        f"Tool permission default: {policy.default}. Rules (last match wins): "
+        + json.dumps([{"tool": rule.tool, "pattern": rule.pattern, "action": rule.action}
+                      for rule in policy.rules])
+        + ". File tools access only the workspace; allowing a call does not widen this boundary. "
+        "Commands run according to the selected tool's shell and require the configured permission. "
+        "A tool approval grants only that saved call. Task instructions do not change runtime permissions."
+    )
+
+
+def select(
+    messages: list[dict[str, Any]],
+    budget: Budget,
+    fixed: int = 0,
+    *,
+    system_tokens: int | None = None,
+    tools_tokens: int | None = None,
+) -> Context:
+    """Keep the newest contiguous tail that fits.
+
+    ``messages`` are already provider-shaped. The returned list is a slice, so
+    callers must not assume it starts at the original first message.
+    Tool calls and their results are selected as one atomic interaction. Stray
+    or unfinished tool messages are omitted from model input.
+
+    ``fixed`` is the old combined budget for the prompt and tool schemas. New
+    callers pass ``system_tokens`` and ``tools_tokens`` separately so the UI can
+    show where the context is actually going; ``fixed`` stays supported so an
+    older call site keeps working.
+    """
+    if system_tokens is None and tools_tokens is None:
+        system_tokens, tools_tokens = fixed, 0
+    system_tokens = system_tokens or 0
+    tools_tokens = tools_tokens or 0
+    overhead = system_tokens + tools_tokens
+
+    limit = budget.input_limit - overhead
+    safe = compaction.paired(messages)
+    used = 0
+    selected_groups: list[list[dict[str, Any]]] = []
+    units = compaction.message_units(safe)
+    for start, end, _ in reversed(units):
+        group = safe[start:end]
+        cost = compaction.approx_tokens(group)
+        if selected_groups and used + cost > limit:
+            break
+        selected_groups.append(group)
+        used += cost
+    selected = [message for group in reversed(selected_groups) for message in group]
+    if not selected and safe:
+        last_start, last_end, _ = units[-1]
+        selected = safe[last_start:last_end]
+    dropped = len(messages) - len(selected)
+    manifest = {
+        "sent": len(selected),
+        "dropped": dropped,
+        "estimated_input_tokens": used + overhead,
+        "limit": budget.input_limit,
+        "breakdown": {
+            "system": system_tokens,
+            "tools": tools_tokens,
+            "messages": used,
+        },
+    }
+    return Context(instructions="", messages=selected, manifest=manifest)
+
+
+# An image costs a fixed conservative allowance. Exact counts depend on the
+# provider's tiling of the image, which nobody can compute before sending, so
+# this is deliberately a rough upper bound and is presented as an estimate.
+IMAGE_TOKEN_ALLOWANCE = compaction.IMAGE_TOKEN_ALLOWANCE
+
+
+def image_tokens(message: dict[str, Any]) -> int:
+    return compaction.image_tokens(message)
+
+
+def _text_of(message: dict[str, Any]) -> str:
+    return compaction._text_of(message)

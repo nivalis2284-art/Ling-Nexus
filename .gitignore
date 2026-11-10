@@ -1,0 +1,38 @@
+.venv/
+.venv.invalid-*/
+__pycache__/
+*.pyc
+.pytest_cache/
+pytest-of-*/
+.ruff_cache/
+.artifacts/
+.nexus-data/
+attachments/
+.codex-remote-attachments/
+nexus-wakeup-staged-*/
+docs/evidence/plugin-acceptance/_tmp/
+pip-install-*/
+pip-ephem-wheel-cache-*/
+pip-build-tracker-*/
+*.egg-info/
+build/
+dist/
+
+# Local DSH agent skills and harness state: workspace-private, never pushed.
+.dsh/
+
+# Local agent working memory: workspace-private, never pushed.
+.workbuddy-ai/
+.workbuddy/
+
+# Local runtime scratch: browser profiles, agent logs and scratch databases.
+Work/
+/Cache/
+
+
+# Local media artifacts (videos, generated frames, caches): workspace-private.
+media/
+
+# Local archive: superseded frontends, one-off scripts and build caches.
+# Kept on disk for reference only, never pushed.
+_archive/

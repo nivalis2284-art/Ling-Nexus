@@ -1,0 +1,762 @@
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import shutil
+import sys
+import threading
+import uuid
+import zipfile
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+from ..mcp import ServerConfig
+from ..runtime.stream import runtime_updates
+from .api import PluginHost
+from .chat import ChatSubscription
+from .events import EventStore
+from .hooks import HookRegistry
+
+
+@dataclass
+class Entry:
+    id: str
+    path: Path
+    manifest: dict
+    settings: dict = field(default_factory=dict)
+    enabled: bool = False
+    status: str = 'unloaded'
+    error: str = ''
+    active_calls: int = 0
+    instance: Any = None
+    services: dict = field(default_factory=dict)
+    python: Path | None = None
+    pending_operation: str = ''
+    progress: str = ''
+    loading: bool = False
+    chat_subscriptions: set = field(default_factory=set)
+    pending_update: tuple[Path, dict, bool] | None = None
+
+
+class PluginManager:
+    def __init__(self, state: dict, root: Path | None = None):
+        self.state = state
+        self.home = state['store'].home
+        self.root = (root or Path(__file__).resolve().parents[2] / 'plugins').resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.entries: dict[str, Entry] = {}
+        self.lock = threading.RLock()
+        self.local = threading.local()
+        self.hooks = HookRegistry(self)
+        self.base_url = ''
+        self.error = ''
+        self.closing = False
+        self._events_stop = threading.Event()
+        self._events_thread = None
+        self.events = EventStore(self.home / 'plugin-events.sqlite3')
+        self.registry_file = self.home / 'plugins.json'
+        self.saved = json.loads(self.registry_file.read_text(encoding='utf-8')) if self.registry_file.exists() else {}
+        self._host_runtime = None
+        self.scan()
+
+    @property
+    def runtime(self):
+        with self.lock:
+            if self._host_runtime is None:
+                from .host.runtime import Runtime
+                self._host_runtime = Runtime(self)
+            return self._host_runtime
+
+    def data_dir(self, plugin_id):
+        path = self.home / 'plugins' / plugin_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _save(self):
+        if self.closing:
+            return
+        self.saved.update({key: {'enabled': item.enabled, 'settings': item.settings}
+                           for key, item in self.entries.items()})
+        self.home.mkdir(parents=True, exist_ok=True)
+        temporary = self.registry_file.with_suffix('.tmp')
+        temporary.write_text(json.dumps(self.saved, ensure_ascii=False, indent=2), encoding='utf-8')
+        temporary.replace(self.registry_file)
+
+    @staticmethod
+    def read_manifest(path):
+        value = json.loads((path / 'plugin.json').read_text(encoding='utf-8'))
+        plugin_id = value.get('id', '')
+        if not isinstance(plugin_id, str) or not plugin_id or any(c not in 'abcdefghijklmnopqrstuvwxyz0123456789-_' for c in plugin_id):
+            raise ValueError('插件标识仅支持小写字母、数字、连字符和下划线')
+        from .host import require_capabilities
+        require_capabilities(value.get('requires_host', {}))
+        if value.get('api_version', 1) != 1:
+            raise ValueError('不支持此插件所需的宿主接口版本')
+        from .pages import declarations
+        declarations(value.get('pages', []))
+        return value
+
+    def scan(self):
+        with self.lock:
+            for path in sorted(self.root.iterdir()):
+                if path.name.startswith('.') or not path.is_dir() or not (path / 'plugin.json').is_file():
+                    continue
+                try:
+                    manifest = self.read_manifest(path)
+                    plugin_id = manifest['id']
+                    if plugin_id in self.entries:
+                        current = self.entries[plugin_id]
+                        if current.path != path:
+                            raise ValueError('插件标识重复')
+                        if current.status == 'unloaded':
+                            current.manifest = manifest
+                        continue
+                    saved = self.saved.get(plugin_id, {})
+                    self.entries[plugin_id] = Entry(plugin_id, path, manifest,
+                        settings=dict(saved.get('settings', {})),
+                        enabled=bool(saved.get('enabled', manifest.get('default_enabled', False))))
+                except (OSError, ValueError) as error:
+                    key = path.name
+                    self.entries[key] = Entry(key, path, {'id': key, 'name': key}, status='error', error=str(error))
+        return self.snapshot()
+
+    def snapshot(self):
+        with self.lock:
+            return {'root': str(self.root), 'error': self.error, 'plugins': [
+                {**{key: item.manifest.get(key, default) for key, default in (
+                    ('name', item.id), ('version', ''), ('description', ''), ('pages', []),
+                    ('settings_schema', {}), ('capabilities', []))},
+                 'id': item.id, 'enabled': item.enabled, 'status': item.status,
+                 'error': item.error, 'active_calls': item.active_calls,
+                 'settings': deepcopy(item.settings), 'progress': item.progress} for item in self.entries.values()]}
+
+    def start(self, base_url):
+        self.base_url = base_url
+        tasks = self.state.get('tasks')
+        if tasks:
+            heads = tasks.change_heads()
+            for key, column in (('task_cursor', 'notifications'), ('message_cursor', 'messages')):
+                if self.events.metadata(key) is None:
+                    self.events.metadata(key, heads[column])
+        for item in list(self.entries.values()):
+            if item.enabled:
+                self.load(item.id)
+        self._events_stop.clear()
+        self._events_thread = threading.Thread(
+            target=self._poll_events, name='plugin-events', daemon=True)
+        self._events_thread.start()
+
+    def _poll_events(self):
+        while not self._events_stop.wait(.5):
+            try:
+                self.poll()
+            except Exception as error:  # noqa: BLE001 -- keep the event worker alive.
+                self.error = str(error)
+
+    def load(self, plugin_id):
+        with self.lock:
+            item = self.entries[plugin_id]
+            if self.closing or item.status in ('loading', 'ready', 'draining', 'closing'):
+                return
+            item.enabled, item.status, item.error = True, 'loading', ''
+            item.loading = True
+            self._save()
+        threading.Thread(target=self._load, args=(item,), name='plugin-load-' + plugin_id, daemon=True).start()
+
+    def _load(self, item):
+        from .environment import prepare
+        with self.lock:
+            item.loading = True
+        try:
+            item.python = prepare(item.path, self.data_dir(item.id), item.manifest,
+                                  on_progress=lambda message: setattr(item, 'progress', message))
+            if item.manifest.get('requires_host'):
+                self.runtime.bridge.environment(item.id)
+            location = item.manifest.get('entry')
+            if location:
+                filename, _, factory = location.partition(':')
+                target = self.asset(item.id, filename)
+                name = 'nexus_extension_' + item.id.replace('-', '_')
+                spec = importlib.util.spec_from_file_location(name, target,
+                    submodule_search_locations=[str(target.parent)])
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+                item.instance = getattr(module, factory or 'create_plugin')(PluginHost(self, item.id))
+            for service in item.manifest.get('services', []):
+                self.connect_service(item.id, service['name'], service)
+            if item.instance and hasattr(item.instance, 'start'):
+                item.instance.start()
+            if item.manifest.get('subscriptions'):
+                self.events.subscribe(item.id, item.manifest['subscriptions'])
+            with self.lock:
+                if item.enabled and not self.closing and item.status == 'loading':
+                    for hook_name in ('before_tool', 'after_tool'):
+                        callback = getattr(item.instance, hook_name, None)
+                        if callback:
+                            self.hooks.subscribe(item.id, 'host.' + hook_name,
+                                lambda payload, scope, callback=callback: callback(scope=scope, **payload),
+                                'legacy', required=hook_name == 'before_tool'
+                                and item.manifest.get('tool_hook_required', False))
+                    item.status = 'ready'
+                    if self._host_runtime:
+                        self._host_runtime.ready(item.id)
+                    item.progress = ''
+                    self.events.pause(item.id, False)
+                else:
+                    item.status = 'draining'
+                    self._close_chat_subscriptions(item)
+        except Exception as error:  # noqa: BLE001 -- loading failures belong in plugin status.
+            with self.lock:
+                item.error = f'{type(error).__name__}: {error}'
+                item.status = 'draining'
+                if not item.pending_operation:
+                    item.pending_operation = 'load_failed'
+                self._close_chat_subscriptions(item)
+        finally:
+            with self.lock:
+                item.loading = False
+            self._cleanup(item)
+
+    def operate(self, plugin_id, operation):
+        item = self.entries[plugin_id]
+        if operation == 'load':
+            self.load(plugin_id)
+        elif operation in ('unload', 'restart', 'uninstall'):
+            if self._begin_drain(item, operation):
+                self._cleanup(item)
+        elif operation == 'stop':
+            stopped = False
+            callback = getattr(item.instance, 'stop', None)
+            if callback:
+                callback()
+                stopped = True
+            if not stopped:
+                raise ValueError('当前没有可停止的插件在途工作')
+        else:
+            raise ValueError('未知插件操作')
+        return self.snapshot()
+
+    def _begin_drain(self, item, operation):
+        with self.lock:
+            if item.status == 'closing' or (item.status == 'draining' and item.pending_operation):
+                raise ValueError('插件正在收尾，请等待当前操作完成')
+            item.enabled = False
+            item.pending_operation = operation
+            was_loading = item.status == 'loading'
+            item.status = 'draining'
+            self.hooks.remove_plugin(item.id)
+            if self._host_runtime:
+                self._host_runtime.suspend(item.id)
+            self._close_chat_subscriptions(item)
+            self.events.pause(item.id, True)
+            self._save()
+        return not was_loading
+
+    def _close_resources(self, item):
+        try:
+            if item.instance and hasattr(item.instance, 'close'):
+                item.instance.close()
+        finally:
+            self.hooks.remove_plugin(item.id)
+            if self._host_runtime:
+                self._host_runtime.release(item.id)
+            item.instance = None
+            for name in list(item.services.values()):
+                self.state['mcp'].remove(name)
+            item.services.clear()
+
+    def _close_chat_subscriptions(self, item):
+        # Called with the manager lock held, so no new subscription can be
+        # registered between changing lifecycle state and closing this set.
+        subscriptions = tuple(item.chat_subscriptions)
+        item.chat_subscriptions.clear()
+        for subscription in subscriptions:
+            subscription.close()
+
+    def _cleanup(self, item):
+        with self.lock:
+            if item.loading or item.active_calls or item.status != 'draining':
+                return
+            item.status = 'closing'
+        try:
+            self._close_resources(item)
+            operation = item.pending_operation
+            item.pending_operation = ''
+            if operation == 'update':
+                source, manifest, was_enabled = item.pending_update
+                item.pending_update = None
+                try:
+                    self._replace_plugin(item.path, source)
+                    item.manifest = manifest
+                    item.error = ''
+                finally:
+                    if source.exists():
+                        self._remove_directory(source)
+            if operation == 'uninstall':
+                # Verify the actual target; imported directories always live under root.
+                target = item.path.resolve()
+                if target.parent != self.root:
+                    raise ValueError('插件目录不在当前插件根目录中')
+                shutil.rmtree(target)
+                with self.lock:
+                    self.entries.pop(item.id, None)
+                    self.saved[item.id] = {'enabled': False, 'settings': item.settings}
+            with self.lock:
+                item.status = 'error' if operation == 'load_failed' else 'unloaded'
+                self._save()
+            if operation == 'restart' and not self.closing:
+                self.load(item.id)
+            if operation == 'update' and was_enabled and not self.closing:
+                self.load(item.id)
+        except Exception as error:  # noqa: BLE001 -- unloading must expose its actual failure.
+            if item.pending_update:
+                source, _, _ = item.pending_update
+                item.pending_update = None
+                if source.exists():
+                    self._remove_directory(source)
+            item.status, item.error = 'error', str(error)
+
+    @contextmanager
+    def lease(self, plugin_id, context=None, scope=None, *, allow_loading=False):
+        item = self.entries[plugin_id]
+        with self.lock:
+            allowed = ('ready', 'loading') if allow_loading else ('ready',)
+            if self.closing or not item.enabled or item.status not in allowed:
+                raise ValueError('插件已停用或尚未就绪')
+            item.active_calls += 1
+            settings = deepcopy(item.settings)
+        previous = getattr(self.local, 'call', None)
+        previous_settings = getattr(self.local, 'settings', None)
+        self.local.call = (plugin_id, context, scope or {})
+        self.local.settings = settings
+        try:
+            yield item
+        finally:
+            self.local.call = previous
+            self.local.settings = previous_settings
+            with self.lock:
+                item.active_calls -= 1
+            if item.status == 'draining':
+                self._cleanup(item)
+
+    def chat_subscribe(self, plugin_id):
+        with self.lease(plugin_id, allow_loading=True) as item, self.lock:
+            # Unload may have started after the lease was granted.
+            if self.closing or not item.enabled or item.status not in ('loading', 'ready'):
+                raise ValueError('插件已停用或尚未就绪')
+            if self.state.get('application') is None:
+                raise RuntimeError('application is not available')
+
+            def forget(subscription):
+                with self.lock:
+                    item.chat_subscriptions.discard(subscription)
+
+            subscription = ChatSubscription(runtime_updates(self.state), forget)
+            item.chat_subscriptions.add(subscription)
+            return subscription
+
+    def enabled_ids(self):
+        with self.lock:
+            return [item.id for item in self.entries.values() if item.enabled and item.status == 'ready']
+
+    def configure(self, plugin_id, values):
+        with self.lock:
+            item = self.entries[plugin_id]
+            item.settings = deepcopy(values)
+            self._save()
+        return self.snapshot()
+
+    def call(self, plugin_id, action, values=None, scope=None):
+        with self.lease(plugin_id, scope=scope) as item:
+            if not item.instance or not hasattr(item.instance, 'call'):
+                remote = item.manifest.get('call_handler')
+                if remote:
+                    return self.call_service(plugin_id, remote['service'], remote['tool'], {'action': action, 'values': values or {}})
+                raise ValueError('插件没有提供此操作接口')
+            return item.instance.call(action, values or {})
+
+    def page(self, plugin_id, page_id, payload):
+        from .pages import validate_view
+        item = self.entries[plugin_id]
+        page = next((p for p in item.manifest.get('pages', []) if p.get('id') == page_id), None)
+        if not page or page.get('renderer') != 'host':
+            raise ValueError('宿主渲染页面不存在')
+        if not isinstance(payload, dict) or payload.get('event') not in ('open', 'action'):
+            raise ValueError('页面事件仅支持 open 或 action')
+        for key in ('values', 'context', 'arguments'):
+            if not isinstance(payload.get(key, {}), dict):
+                raise ValueError(key + ' 必须是对象')
+        if payload['event'] == 'action' and (not isinstance(payload.get('action'), str) or not payload['action'] or payload['action'].startswith('$')):
+            raise ValueError('页面操作标识无效')
+        values = {k: payload[k] for k in ('event', 'action', 'values', 'context', 'arguments', 'request_id') if k in payload}
+        values['page_id'] = page_id
+        return validate_view(self.call(plugin_id, page['action'], values))
+
+    def expand(self, item, value):
+        replacements = {'{plugin}': str(item.path), '{data}': str(self.data_dir(item.id)),
+                        '{python}': str(item.python or sys.executable)}
+        if isinstance(value, str):
+            for key, replacement in replacements.items():
+                value = value.replace(key, replacement)
+        elif isinstance(value, list):
+            value = [self.expand(item, v) for v in value]
+        elif isinstance(value, dict):
+            value = {k: self.expand(item, v) for k, v in value.items()}
+        return value
+
+    def connect_service(self, plugin_id, name, config):
+        item = self.entries[plugin_id]
+        full_name = 'plugin_' + plugin_id + '_' + name
+        values = self.expand(item, {**config, 'name': full_name})
+        if item.manifest.get('requires_host'):
+            values['env'] = {**values.get('env', {}), **self.runtime.bridge.environment(plugin_id)}
+        cfg = ServerConfig.from_dict(values)
+        if cfg is None:
+            raise ValueError('插件服务声明缺少命令或地址')
+        self.state['mcp'].add(cfg, cwd=item.path)
+        item.services[name] = full_name
+        server = self.state['mcp'].servers[full_name]
+        server.plugin_id = plugin_id
+        server.model_tools = values.get('model_tools', [])
+        return {'name': full_name}
+
+    def call_service(self, plugin_id, name, tool, args):
+        item = self.entries[plugin_id]
+        current = getattr(self.local, 'call', None)
+        if not item.enabled and not (current and current[0] == plugin_id):
+            raise ValueError('插件已停用')
+        server = self.state['mcp'].servers.get(item.services.get(name))
+        if server is None:
+            raise ValueError('插件服务未连接')
+        result = server.call_tool(tool, args)
+        if not result.ok:
+            raise ValueError(result.text)
+        return result.structured_content if result.structured_content is not None else json.loads(result.text)
+
+    def decorate(self, registry, context, scope):
+        # Save original host operations before plugin-owned extensions replace a tool.
+        context.plugin_original_tools = {spec.name: spec for spec in registry.specs()}
+        for plugin_id in self.enabled_ids():
+            item = self.entries[plugin_id]
+            if not item.instance or not hasattr(item.instance, 'tools'):
+                continue
+            with self.lease(plugin_id, context, scope):
+                additions = item.instance.tools(deepcopy(scope))
+            for spec in additions:
+                if registry.get(spec.name) and spec.name not in item.manifest.get('overrides', []):
+                    raise ValueError(f'插件 {plugin_id} 工具重名: {spec.name}')
+                def invoke(ctx, args, spec=spec, plugin_id=plugin_id):
+                    with self.lease(plugin_id, ctx, scope):
+                        return spec.handler(ctx, args)
+                registry._tools[spec.name] = replace(spec, handler=invoke)
+        context.plugin_manager = self
+        context.plugin_scope = scope
+
+    def prepare_agent(self, agent, messages):
+        """Compose only a disposable view; never append recalls to saved history."""
+        scope = {**getattr(agent, 'plugin_scope', {}), 'messages': deepcopy(messages)}
+        from .. import skills
+        if not hasattr(agent, '_plugin_base_skills'):
+            agent._plugin_base_skills = getattr(agent, 'skills', '')
+            agent._plugin_base_skill_bodies = dict(getattr(agent.context, 'skills', {}))
+            agent._plugin_base_skill_paths = dict(getattr(agent.context, 'skill_paths', {}))
+        agent.context.skills = dict(agent._plugin_base_skill_bodies)
+        agent.context.skill_paths = dict(agent._plugin_base_skill_paths)
+        manifests = [agent._plugin_base_skills]
+        for plugin_id in self.enabled_ids():
+            found = skills.discover([self.entries[plugin_id].path / 'skills'])
+            found.skills = {name: value for name, value in found.skills.items()
+                            if name not in agent.context.skills}
+            agent.context.skills.update(found.bodies())
+            agent.context.skill_paths.update(found.paths())
+            if found.skills:
+                manifests.append(found.manifest())
+        agent.skills = '\n'.join(value for value in manifests if value)
+        if not hasattr(agent, '_plugin_base_tools'):
+            mcp = getattr(agent.context, 'mcp', None)
+            owned = {name for name, (server, _) in (mcp.tools.items() if mcp else [])
+                     if getattr(server, 'plugin_id', None)}
+            agent._plugin_base_tools = {key: spec for key, spec in agent.registry._tools.items() if key not in owned}
+        agent.registry._tools = dict(agent._plugin_base_tools)
+        from ..tools.mcp_tools import specs_for
+        for spec in specs_for(agent.context):
+            agent.registry._tools.setdefault(spec.name, spec)
+        self.decorate(agent.registry, agent.context, {k: v for k, v in scope.items() if k != 'messages'})
+        from ..core import compaction, prompt
+        profile = getattr(agent, 'profile', None)
+        if profile is not None:
+            from ..core.effort import output_reserve
+            budget = prompt.Budget(
+                context_limit=agent.context_limit or profile.context_window_tokens or 64_000,
+                output_reserve=output_reserve(profile, getattr(agent, 'effort', None)))
+            base_system = prompt.build_system_prompt(
+                agent.workspace, agent.registry.declarations(),
+                platform=sys.platform, date='YYYY-MM-DD',
+                role=agent.role, owner_instructions=agent.owner_context, skills=agent.skills,
+                task_context=agent.task_context, interaction_context=agent.interaction_context)
+            newest = scope['messages'][-1:]
+            scope['material_budget_tokens'] = max(0, budget.input_limit
+                - prompt.estimate(base_system) - prompt.estimate(json.dumps(agent.registry.schema()))
+                - compaction.approx_tokens(newest) - 128)
+        materials, reports = self.context(scope)
+        # Dependency order is supplied by the manifest; presentation follows purpose.
+        agent.request_materials = materials
+        agent.request_plugins = reports
+        agent.plugin_context = '\n\n'.join(
+            f"[Plugin {value['plugin_id']}; source={value['source']}; purpose={value.get('purpose', 'reference')}]\n{value.get('content', '')}"
+            for value in materials if value.get('content'))
+        warnings = [f"插件 {report['id']} 的补充资料本次获取失败：{report['error']}。这不表示没有相关资料。"
+                    for report in reports if report['status'] == 'failed']
+        if warnings:
+            agent.plugin_context += '\n\n[本次资料缺失说明]\n' + '\n'.join(warnings)
+        return scope['messages']
+
+    def context(self, scope):
+        materials, reports = [], []
+        ready = self.enabled_ids()
+        required_ids = set(scope.get('required_plugins', []))
+        missing = required_ids.difference(ready)
+        if missing:
+            raise ValueError('本次必需的插件已停用或未就绪: ' + ', '.join(sorted(missing)))
+        reports.extend({'id': item.id, 'status': 'skipped', 'reason': '插件已停用或尚未就绪', 'required': False}
+                       for item in self.entries.values() if item.id not in ready)
+        for plugin_id in self.context_order():
+            item = self.entries[plugin_id]
+            required = plugin_id in required_ids
+            callback = getattr(item.instance, 'context', None)
+            remote = item.manifest.get('context')
+            if not callback and not remote:
+                continue
+            try:
+                with self.lease(plugin_id, scope=scope):
+                    if callback:
+                        result = callback(deepcopy(scope)) or []
+                    else:
+                        result = self.call_service(plugin_id, remote['service'], remote['tool'], {'scope': deepcopy(scope)})
+                if isinstance(result, dict):
+                    if 'messages' in result:
+                        scope['messages'] = deepcopy(result['messages'])
+                    result = result.get('materials', [])
+                for material in result:
+                    materials.append({**material, 'plugin_id': plugin_id, 'source': material.get('source') or plugin_id})
+                reports.append({'id': plugin_id, 'status': 'used' if result else 'not_applicable', 'required': required})
+            except Exception as error:
+                item.error = str(error)
+                reports.append({'id': plugin_id, 'status': 'failed', 'error': str(error), 'required': required})
+                if required:
+                    raise ValueError(f'必需的插件资料不可用: {plugin_id}: {error}') from error
+        return materials, reports
+
+    def context_order(self):
+        ordered, visiting = [], set()
+        available = self.enabled_ids()
+        def visit(plugin_id):
+            if plugin_id in ordered:
+                return
+            if plugin_id in visiting:
+                raise ValueError('上下文参与依赖成环: ' + plugin_id)
+            visiting.add(plugin_id)
+            for predecessor in self.entries[plugin_id].manifest.get('context_after', []):
+                if predecessor in available:
+                    visit(predecessor)
+            visiting.remove(plugin_id)
+            ordered.append(plugin_id)
+        for plugin_id in available:
+            visit(plugin_id)
+        return ordered
+
+    def hook(self, hook_name, scope, **values):
+        self.hooks.emit('host.' + hook_name, values, scope)
+
+    def publish(self, event_type, data, event_id=None):
+        self.events.publish(event_type, data, event_id)
+        if self._host_runtime:
+            for owner in self.enabled_ids():
+                self._host_runtime.store.emit(owner, '', event_type, data)
+
+    def poll(self):
+        tasks = self.state.get('tasks')
+        if tasks:
+            cursor = int(self.events.metadata('task_cursor') or 0)
+            for notice in tasks.notifications(after=cursor, limit=100):
+                self.publish('task.notification', notice, 'task-notice-' + str(notice['id']))
+                cursor = notice['id']
+                self.events.metadata('task_cursor', cursor)
+            cursor = int(self.events.metadata('message_cursor') or 0)
+            for message in tasks.message_changes(after=cursor, limit=100):
+                self.publish('message.saved', message, 'task-message-' + str(message['seq']))
+                cursor = message['seq']
+                self.events.metadata('message_cursor', cursor)
+        for plugin_id in self.enabled_ids():
+            item = self.entries[plugin_id]
+            for change in self.events.changes(plugin_id):
+                if change['subscribed']:
+                    try:
+                        with self.lease(plugin_id):
+                            value = {k: v for k, v in change.items() if k != 'subscribed'}
+                            if hasattr(item.instance, 'on_event'):
+                                item.instance.on_event(value)
+                            elif item.manifest.get('event_handler'):
+                                remote = item.manifest['event_handler']
+                                self.call_service(plugin_id, remote['service'], remote['tool'], {'event': value})
+                    except Exception as error:  # noqa: BLE001 -- keep this subscription cursor until callback succeeds.
+                        item.error = str(error)
+                        break
+                self.events.ack(plugin_id, change['seq'])
+
+    def receive(self, plugin_id, payload):
+        if plugin_id not in self.entries:
+            raise ValueError('插件尚未登记')
+        item = self.entries[plugin_id]
+        return self.events.add(plugin_id, payload, item.enabled and item.status == 'ready')
+
+    def query(self, plugin_id, topic, **args):
+        tasks = self.state.get('tasks')
+        if topic == 'state':
+            return {'plugins': self.snapshot()}
+        if topic == 'tasks.list':
+            return [task.to_dict() for task in tasks.list()]
+        if topic == 'tasks.get':
+            return tasks.get(args.get('id') or args.get('task_id')).to_dict()
+        if topic == 'tasks.messages':
+            return tasks.messages(args.get('id') or args.get('task_id'))
+        if topic == 'tasks.operations':
+            return tasks.unfinished_operations(args.get('id') or args.get('task_id'))
+        if topic == 'tasks.notifications':
+            return tasks.notifications(after=args.get('after', 0), limit=args.get('limit', 100))
+        if topic == 'sessions.messages':
+            session = self.state['sessions'].load(args['id'])
+            return [{'kind': value.kind, 'text': value.text, 'data': value.data} for value in session.items] if session else []
+        if topic == 'sessions.records':
+            session = self.state['sessions'].load(args['id'])
+            if session is None:
+                raise ValueError('会话不存在')
+            return [{key: value for key, value in item.to_record().items() if key != 'thinking'}
+                    for item in session.items]
+        if topic == 'ling.identity':
+            runtime = self.state.get('ling')
+            if runtime and getattr(runtime, 'session_id', None):
+                return {'session_id': runtime.session_id}
+            from ..ling import ling_session_id
+            return {'session_id': ling_session_id(tasks)}
+        raise ValueError('未知宿主查询: ' + topic)
+
+    def command(self, plugin_id, action, **args):
+        current = getattr(self.local, 'call', None)
+        if action.startswith('work.'):
+            context = current[1] if current else None
+            service = getattr(context, 'work_service', None)
+            if service is None:
+                raise ValueError('当前调用没有工作监督上下文')
+            return getattr(service, action.split('.')[1])(**args)
+        if action in ('task.pause', 'task.resume', 'task.cancel'):
+            task_id = args.get('id') or args.get('task_id')
+            controller, store = self.state['task_controller'], self.state['tasks']
+            task = store.get(task_id)
+            getattr(controller, action.split('.')[1])(task_id,
+                request_id=args.get('request_id') or f'plugin-{plugin_id}-{uuid.uuid4().hex}',
+                expected_version=task.control_version)
+            return store.get(task_id).to_dict()
+        raise ValueError('未知宿主操作: ' + action)
+
+    def readme(self, plugin_id):
+        item = self.entries[plugin_id]
+        if not (item.path / 'README.md').exists():
+            return {'content': None}
+        content = self.asset(plugin_id, 'README.md').read_text(encoding='utf-8-sig')
+        return {'content': content if content.strip() else None}
+
+    def asset(self, plugin_id, relative):
+        item = self.entries[plugin_id]
+        target = (item.path / relative).resolve()
+        if not target.is_relative_to(item.path.resolve()) or not target.is_file():
+            raise ValueError('插件文件不存在或不属于此插件')
+        return target
+
+    def _remove_directory(self, path):
+        target = path.resolve()
+        if target.parent != self.root:
+            raise ValueError('待移除目录不在插件根目录中')
+        shutil.rmtree(target)
+
+    def _replace_plugin(self, target, source):
+        backup = self.root / ('.previous-' + uuid.uuid4().hex)
+        if target.exists():
+            target.rename(backup)
+        try:
+            source.rename(target)
+        except Exception:
+            if backup.exists():
+                backup.rename(target)
+            raise
+        if backup.exists():
+            self._remove_directory(backup)
+
+    def import_zip(self, content: bytes, replace_existing=False):
+        staging = self.root / ('.import-' + uuid.uuid4().hex)
+        staging.mkdir()
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                for info in archive.infolist():
+                    target = (staging / info.filename).resolve()
+                    if not target.is_relative_to(staging.resolve()):
+                        raise ValueError('插件包包含目录外文件')
+                archive.extractall(staging)
+            candidates = list(staging.glob('plugin.json')) + list(staging.glob('*/plugin.json'))
+            if len(candidates) != 1:
+                raise ValueError('插件包应包含唯一的 plugin.json')
+            source = candidates[0].parent
+            manifest = self.read_manifest(source)
+            plugin_id = manifest['id']
+            previous = self.entries.get(plugin_id)
+            if previous and not replace_existing:
+                return {'conflict': True, 'error': '该插件已安装，请确认替换', 'plugin': manifest,
+                        'installed_version': previous.manifest.get('version', '')}
+            if previous:
+                with self.lock:
+                    if previous.status in ('draining', 'closing'):
+                        raise ValueError('插件正在收尾，请等待当前操作完成')
+                    pending = self.root / ('.update-' + uuid.uuid4().hex)
+                    source.rename(pending)
+                    previous.pending_update = (pending, manifest, previous.enabled)
+                    try:
+                        cleanup = self._begin_drain(previous, 'update')
+                    except Exception:
+                        previous.pending_update = None
+                        self._remove_directory(pending)
+                        raise
+                if cleanup:
+                    self._cleanup(previous)
+            else:
+                self._replace_plugin(self.root / plugin_id, source)
+                self.scan()
+            return self.snapshot()
+        finally:
+            if staging.exists():
+                self._remove_directory(staging)
+
+    def close(self):
+        with self.lock:
+            self.closing = True
+        if self._host_runtime:
+            for owner in list(self.entries):
+                self._host_runtime.suspend(owner)
+        self._events_stop.set()
+        for item in list(self.entries.values()):
+            with self.lock:
+                if item.status in ('draining', 'closing'):
+                    self._close_chat_subscriptions(item)
+                    continue
+                needs_unload = item.loading or item.instance or item.services or item.chat_subscriptions
+                cleanup = self._begin_drain(item, 'unload') if needs_unload else False
+            if cleanup:
+                self._cleanup(item)
+        if self._events_thread and self._events_thread is not threading.current_thread():
+            self._events_thread.join(timeout=5)
+        if self._host_runtime:
+            self._host_runtime.close()

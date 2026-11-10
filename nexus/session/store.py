@@ -1,0 +1,308 @@
+"""JSONL sessions: one file per conversation, one JSON object per line.
+
+A session file is append-only during a run and rewritten only for edits
+(delete/rewrite). That keeps the common path cheap and the failure mode simple:
+a torn last line is dropped on load instead of losing the whole file.
+
+Record kinds:
+    meta      {"kind":"meta","id":..,"title":..,"created_at":..,"model":..}
+    user      {"kind":"user","text":..,"at":..}
+    assistant {"kind":"assistant","text":..,"at":..}
+    tool      {"kind":"tool","id":..,"name":..,"arguments":{..},"result":{..},"at":..}
+    notice    {"kind":"notice","text":..,"at":..}
+"""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from ..file_io import replace_text
+
+TITLE_LIMIT = 80
+DEFAULT_TITLE = "新会话"
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def normalize_title(title: str | None) -> str:
+    """Trim, cap and default a session title so it is always displayable."""
+    text = (title or "").strip()
+    if not text:
+        return DEFAULT_TITLE
+    return text[:TITLE_LIMIT]
+
+
+def new_session_id() -> str:
+    return "s" + uuid.uuid4().hex[:16]
+
+
+@dataclass
+class Message:
+    kind: str
+    text: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    at: str = ""
+
+    def to_record(self) -> dict[str, Any]:
+        record = {"kind": self.kind, "text": self.text, "at": self.at or _now()}
+        record.update(self.data)
+        return record
+
+
+@dataclass
+class Session:
+    id: str
+    title: str = ""
+    created_at: str = ""
+    model: str = ""
+    items: list[Message] = field(default_factory=list)
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    _path: Path | None = None
+
+    def remove_items(self, removed: set[int]) -> None:
+        """Remove records while keeping checkpoint boundaries on surviving history."""
+        items, remap = [], {}
+        for index, item in enumerate(self.items):
+            if index in removed:
+                continue
+            if item.kind == "checkpoint":
+                through = int(item.data["through"])
+                boundary = next((old for old in reversed(remap) if old <= through), None)
+                if boundary is None:
+                    continue
+                item.data["through"] = str(remap[boundary])
+            remap[index] = len(items)
+            items.append(item)
+        self.items = items
+
+
+class SessionStore:
+    """Files in one directory; no index, no database."""
+
+    def __init__(self, directory: Path, *, identities: bool = False) -> None:
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self.identity_enabled = identities
+        self.on_change = None
+
+    def path_for(self, session_id: str) -> Path:
+        if not session_id or not session_id.replace("_", "").isalnum():
+            raise ValueError("invalid session id")
+        return self.directory / f"{session_id}.jsonl"
+
+    # --- reading ---------------------------------------------------------
+
+    def list(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for path in self.directory.glob("*.jsonl"):
+            session = self.load(path.stem)
+            if session is None:
+                continue
+            last = ""
+            for item in reversed(session.items):
+                if item.kind in ("user", "assistant") and item.text:
+                    last = item.text
+                    break
+            out.append(
+                {
+                    "id": session.id,
+                    "title": session.title or (last[:40] or "新会话"),
+                    "created_at": session.created_at,
+                    "model": session.model,
+                    "messages": sum(1 for i in session.items if i.kind in ("user", "assistant")),
+                    "updated_at": self._mtime(path),
+                }
+            )
+        out.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        return out
+
+    @staticmethod
+    def _mtime(path: Path) -> str:
+        try:
+            return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(path.stat().st_mtime)) + "Z"
+        except OSError:
+            return ""
+
+    def load(self, session_id: str) -> Session | None:
+        with self._lock:
+            return self._load(session_id)
+
+    def _load(self, session_id: str) -> Session | None:
+        try:
+            path = self.path_for(session_id)
+        except ValueError:
+            return None
+        if not path.exists():
+            return None
+        session = Session(id=session_id)
+        session._path = path
+        try:
+            raw = path.read_bytes().splitlines()
+        except OSError:
+            return None
+        for line in raw:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                # A torn trailing line is expected after a hard kill.
+                continue
+            if not isinstance(record, dict):
+                continue
+            kind = record.pop("kind", "")
+            text = record.pop("text", "")
+            at = record.pop("at", "")
+            if kind == "meta":
+                session.title = record.get("title") or session.title
+                session.created_at = record.get("created_at") or session.created_at
+                session.model = record.get("model") or session.model
+                continue
+            if not isinstance(text, str):
+                text = ""
+            session.items.append(Message(kind=str(kind), text=text, data=record, at=str(at)))
+        if self.identity_enabled and self._identities(session):
+            backup = self.directory / '.pre-plugin-sdk-v1' / path.name
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if not backup.exists():
+                backup.write_bytes(path.read_bytes())
+            self._rewrite(session)
+        return session
+
+    @staticmethod
+    def _identity(record):
+        record.setdefault('_record_id', uuid.uuid4().hex)
+        material = {k: v for k, v in record.items() if k not in ('_record_id', '_record_version')}
+        record['_record_version'] = hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def _identities(self, session):
+        changed = False
+        for item in session.items:
+            record = {'kind': item.kind, 'text': item.text, 'at': item.at, **item.data}
+            before = (record.get('_record_id'), record.get('_record_version'))
+            self._identity(record)
+            item.data.update({k: record[k] for k in ('_record_id', '_record_version')})
+            changed |= before != (record['_record_id'], record['_record_version'])
+        return changed
+
+    def _changed(self, session):
+        if self.on_change:
+            self.on_change(session)
+
+    # --- writing ---------------------------------------------------------
+
+    def create(self, model: str, title: str = "") -> Session:
+        session = Session(id=new_session_id(), title=title, created_at=_now(), model=model)
+        session._path = self.path_for(session.id)
+        self._append(
+            session,
+            {"kind": "meta", "id": session.id, "title": title,
+             "created_at": session.created_at, "model": model},
+        )
+        return session
+
+    def append(self, session: Session, message: Message) -> Message:
+        if not message.at:
+            message.at = _now()
+        self._append(session, message.to_record())
+        return message
+
+    def _append(self, session: Session, record: dict[str, Any]) -> None:
+        with self._lock:
+            self._append_record(session, record)
+
+    def _append_record(self, session: Session, record: dict[str, Any]) -> None:
+        path = session.path
+        if path is None:
+            path = self.path_for(session.id)
+            session._path = path
+        if self.identity_enabled and record.get('kind') != 'meta':
+            self._identity(record)
+        line = json.dumps(record, ensure_ascii=False)
+        with path.open("ab+") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.write(b"\n")
+            handle.write((line + "\n").encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if record.get("kind") == "meta":
+            session.title = record.get("title") or session.title
+            session.created_at = record.get("created_at") or session.created_at
+            session.model = record.get("model") or session.model
+        else:
+            kind = record.pop("kind")
+            text = record.pop("text", "")
+            at = record.pop("at", "")
+            session.items.append(Message(kind=str(kind), text=str(text), data=record, at=str(at)))
+            self._changed(session)
+
+    def rewrite(self, session: Session) -> None:
+        """Replace the file with the in-memory items (used by edits/pruning)."""
+        with self._lock:
+            self._rewrite(session)
+
+    def _rewrite(self, session: Session) -> None:
+        if self.identity_enabled:
+            self._identities(session)
+        path = session.path or self.path_for(session.id)
+        session._path = path
+        lines = [
+            json.dumps(
+                {"kind": "meta", "id": session.id, "title": session.title,
+                 "created_at": session.created_at, "model": session.model},
+                ensure_ascii=False,
+            )
+        ]
+        for item in session.items:
+            record = {"kind": item.kind, "text": item.text, "at": item.at}
+            record.update(item.data)
+            lines.append(json.dumps(record, ensure_ascii=False))
+        replace_text(path, "\n".join(lines) + "\n")
+        self._changed(session)
+
+    def rename(self, session_id: str, title: str, *, only_if_empty: bool = False) -> bool:
+        """Set a session's title, persisting it through the meta record.
+
+        Returns False when the session does not exist. The title is trimmed,
+        defaults to "新会话" when empty, and is capped at 80 characters.
+        """
+        with self._lock:
+            session = self.load(session_id)
+            if session is None:
+                return False
+            if not only_if_empty or not session.title:
+                session.title = normalize_title(title)
+                self.rewrite(session)
+            return True
+
+    def delete(self, session_id: str) -> bool:
+        try:
+            path = self.path_for(session_id)
+        except ValueError:
+            return False
+        with self._lock:
+            try:
+                path.unlink()
+                self._changed(Session(id=session_id))
+                return True
+            except OSError:
+                return False
