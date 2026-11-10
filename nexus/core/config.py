@@ -189,7 +189,7 @@ def build_profile(provider: Provider, model: dict[str, Any]) -> ModelProfile:
 
 
 DEFAULT_PROVIDER = {
-    "name": "DeepSeek",
+    "name": "未配置",
     "family": APIFamily.ANTHROPIC_MESSAGES.value,
     # No default endpoint is shipped: nobody should inherit someone else's
     # gateway by cloning this repo. First run asks for it in Settings, and a
@@ -197,7 +197,7 @@ DEFAULT_PROVIDER = {
     "base_url": "",
 }
 DEFAULT_MODEL = {
-    "id": "deepseek-v4.1-flash",
+    "id": "",
     "context_window_tokens": 65536,
     "max_output_tokens": 8192,
     # Reasoning is a first-class feature here; a new model row opts in, and a
@@ -265,17 +265,10 @@ class ConfigStore:
 
     def ensure(self) -> Settings:
         if not self.config_path.exists():
-            provider = Provider(
-                id=_new_id("prov"),
-                name=DEFAULT_PROVIDER["name"],
-                family=DEFAULT_PROVIDER["family"],
-                base_url=DEFAULT_PROVIDER["base_url"],
-                models=[dict(DEFAULT_MODEL)],
-            )
             self.write_config(
                 {
-                    "providers": [provider.to_dict()],
-                    "current": {"provider": provider.id, "model": DEFAULT_MODEL["id"]},
+                    "providers": [],
+                    "current": {},
                     "effort": "medium",
                     "max_steps": 40,
                     "permission": "ask",
@@ -314,7 +307,7 @@ class ConfigStore:
         )
         if provider is None:
             provider = Provider.from_dict(DEFAULT_PROVIDER | {"id": _new_id("prov")})
-            provider.models = [dict(DEFAULT_MODEL)]
+            provider.models = [dict(DEFAULT_MODEL)] if DEFAULT_MODEL.get("id") else []
         model = next(
             (m for m in provider.models if m.get("id") == current.get("model")),
             provider.models[0] if provider.models else dict(DEFAULT_MODEL),

@@ -462,7 +462,7 @@ class LingInbox:
         data = json.loads(item["data_json"])
         if not any(message.data.get("ling_input_id") == item["id"] for message in session.items):
             self.state["sessions"].append(session, Message(kind="work_report" if data.get("report") else "user", text=item["text"],
-                 data={**data, "ling_input_id": item["id"], "request_id": item["request_id"]}))
+                 data={**data, "ling_input_id": item["id"], "request_id": dict(item).get("request_id", "")}))
         if history is not None:
             from .attachments import message_content
             content = message_content(item["text"], data.get("attachments", []), include_images=True)

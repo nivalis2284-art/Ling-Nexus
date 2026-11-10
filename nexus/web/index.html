@@ -200,7 +200,7 @@ try {
      <div class="bar-left">
       <button type="button" class="c-btn" id="attach-btn" aria-label="添加附件" title="添加文件，单个文件不超过 25 MiB；图片不超过 5 MiB"><svg class="i"><use href="#i-clip"/></svg></button>
       <input type="file" id="file-input" multiple hidden>
-      <button type="button" class="c-pill" id="model-btn" aria-haspopup="menu"><i class="model-dot"></i><span id="model-label">deepseek-v4.1-flash</span><svg class="i xs"><use href="#i-down"/></svg></button>
+      <button type="button" class="c-pill" id="model-btn" aria-haspopup="menu"><i class="model-dot"></i><span id="model-label">选择模型</span><svg class="i xs"><use href="#i-down"/></svg></button>
       <button type="button" class="c-pill" id="effort-btn" aria-haspopup="menu" aria-label="思考强度"><span class="bars" id="effort-bars" data-level="3"><i></i><i></i><i></i><i></i><i></i></span><span id="effort-label">思考 · 高</span></button>
      </div>
      <div class="bar-right">
@@ -278,7 +278,7 @@ try {
  <div class="sheet-body">
   <header class="sheet-head"><div><h2 id="provider-title">添加提供商</h2><p class="sheet-note">接口协议决定请求体格式；模型可分别设置上下文窗口。</p></div><button class="ic-btn" type="button" data-close="provider-dialog" aria-label="关闭"><svg class="i"><use href="#i-close"/></svg></button></header>
   <div class="fields">
-   <label class="field">名称<input id="p-name" type="text" placeholder="DeepSeek" autocomplete="off"></label>
+   <label class="field">名称<input id="p-name" type="text" placeholder="例如 Anthropic 或 OpenAI" autocomplete="off"></label>
    <label class="field">接口协议<select id="p-family">
     <option value="anthropic_messages">Anthropic Messages（/v1/messages）</option>
     <option value="openai_chat_completions">OpenAI Chat Completions（/v1/chat/completions）</option>
@@ -289,7 +289,7 @@ try {
   <div class="model-editor">
    <div class="sec-h"><h3>模型</h3><span>上下文与最大输出以 token 为单位，留空使用默认值；支持图片输入的模型请勾选多模态。</span></div>
    <div id="p-models-list" class="model-rows"></div>
-   <div class="model-add"><input id="p-model-new" type="text" placeholder="新增模型名，例如 deepseek-v4.1-flash" autocomplete="off" aria-label="新增模型名"><button id="p-model-add" class="btn ghost sm" type="button"><svg class="i xs"><use href="#i-plus"/></svg>添加</button></div>
+   <div class="model-add"><input id="p-model-new" type="text" placeholder="新增模型名" autocomplete="off" aria-label="新增模型名"><button id="p-model-add" class="btn ghost sm" type="button"><svg class="i xs"><use href="#i-plus"/></svg>添加</button></div>
    <p id="p-models-error" class="sheet-error" aria-live="polite"></p>
   </div>
   <label class="field">API Key<input id="p-key" type="password" autocomplete="off" placeholder="sk-..."></label>
